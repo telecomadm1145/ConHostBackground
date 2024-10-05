@@ -5,6 +5,8 @@
 #include <MinHook.h>
 #include <initializer_list>
 #include "stb_image.h"
+#include "stb_image_resize.h"
+#include <vector>
 
 #define INRANGE(x, a, b) (x >= a && x <= b)
 #define GET_BYTE(x) (GET_BITS(x[0]) << 4 | GET_BITS(x[1]))
@@ -117,6 +119,55 @@ void CalculateUniformToFill(int srcWidth, int srcHeight, int dstWidth, int dstHe
     }
 }
 
+// 辅助函数：从 HBITMAP 获取像素数据
+bool GetBitmapPixels(HBITMAP hBitmap, std::vector<unsigned char>& pixels, int& width, int& height) {
+    BITMAP bmp;
+    GetObject(hBitmap, sizeof(BITMAP), &bmp);
+    width = bmp.bmWidth;
+    height = bmp.bmHeight;
+
+    pixels.resize(width * height * 4);
+
+    BITMAPINFO bi = { 0 };
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = width;
+    bi.bmiHeader.biHeight = -height;  // 负值表示自上而下
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    HDC hdc = CreateCompatibleDC(NULL);
+    HBITMAP oldBitmap = (HBITMAP)SelectObject(hdc, hBitmap);
+
+    GetDIBits(hdc, hBitmap, 0, height, pixels.data(), &bi, DIB_RGB_COLORS);
+
+    SelectObject(hdc, oldBitmap);
+    DeleteDC(hdc);
+
+    return true;
+}
+
+// 辅助函数：创建 HBITMAP
+HBITMAP CreateBitmapFromPixels(HDC hdc, const unsigned char* pixels, int width, int height) {
+    BITMAPINFO bi = { 0 };
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = width;
+    bi.bmiHeader.biHeight = -height;  // 负值表示自上而下
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HBITMAP hBitmap = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (hBitmap && bits) {
+        memcpy(bits, pixels, width * height * 4);
+    }
+
+    return hBitmap;
+}
+unsigned char* scaledPixels{};
+int scaledHeight{};
+int scaledWidth{};
 int Microsoft_Console_Render_GdiEngine_EndPaint(void* pthis) {
     if (*((BYTE*)pthis + 56)) {
         HDC thdc = *((HDC*)pthis + 10);
@@ -139,41 +190,48 @@ int Microsoft_Console_Render_GdiEngine_EndPaint(void* pthis) {
         }
 
         if (g_hBitmap) {
-            // 获取背景图像信息
-            BITMAP bmp;
-            GetObject(g_hBitmap, sizeof(BITMAP), &bmp);
-            int srcWidth = bmp.bmWidth;
-            int srcHeight = bmp.bmHeight;
+            // 获取背景图像的像素数据
+            std::vector<unsigned char> srcPixels;
+            int srcWidth, srcHeight;
+            if (GetBitmapPixels(g_hBitmap, srcPixels, srcWidth, srcHeight)) {
+                // 计算 UniformToFill 的参数
+                int scaledX, scaledY, scaledWidth, scaledHeight;
+                CalculateUniformToFill(srcWidth, srcHeight, dstWidth, dstHeight,
+                    scaledX, scaledY, scaledWidth, scaledHeight);
 
-            // 计算 UniformToFill 的参数
-            int scaledX, scaledY, scaledWidth, scaledHeight;
-            CalculateUniformToFill(srcWidth, srcHeight, dstWidth, dstHeight,
-                scaledX, scaledY, scaledWidth, scaledHeight);
+                if (!::scaledPixels || (scaledHeight != ::scaledHeight || scaledWidth != ::scaledWidth)) {
+                    scaledPixels = new unsigned char[scaledWidth * scaledHeight * 4];
+                    // 使用 stb_image_resize 进行缩放
+                    stbir_resize_uint8(srcPixels.data(), srcWidth, srcHeight, srcWidth * 4,
+                        scaledPixels, scaledWidth, scaledHeight, scaledWidth * 4,
+                        4);  // 4 表示 RGBA 四个通道
+                    ::scaledHeight = scaledHeight;
+                    ::scaledWidth = scaledWidth;
+                }
 
-            // 创建背景 DC
-            HDC bgDC = CreateCompatibleDC(memDC);
-            HBITMAP oldBgBitmap = (HBITMAP)SelectObject(bgDC, g_hBitmap);
+                // 创建缩放后的位图
+                HBITMAP scaledBitmap = CreateBitmapFromPixels(memDC, scaledPixels, scaledWidth, scaledHeight);
 
-            // 设置缩放模式为 COLORONCOLOR（最近邻）
-            SetStretchBltMode(memDC, COLORONCOLOR);
+                if (scaledBitmap) {
+                    // 绘制缩放后的背景
+                    HDC scaledDC = CreateCompatibleDC(memDC);
+                    HBITMAP oldScaledBitmap = (HBITMAP)SelectObject(scaledDC, scaledBitmap);
 
-            // 使用 StretchBlt 进行最近邻缩放
-            StretchBlt(memDC,
-                scaledX, scaledY, scaledWidth, scaledHeight,  // 目标矩形
-                bgDC,
-                0, 0, srcWidth, srcHeight,  // 源矩形
-                SRCCOPY);
+                    BitBlt(memDC, 0, 0, dstWidth, dstHeight,
+                        scaledDC, -scaledX, -scaledY, SRCCOPY);
 
-            // 清理背景 DC
-            SelectObject(bgDC, oldBgBitmap);
-            DeleteDC(bgDC);
+                    SelectObject(scaledDC, oldScaledBitmap);
+                    DeleteDC(scaledDC);
+                    DeleteObject(scaledBitmap);
+                }
+            }
         }
 
         // 使用 AlphaBlend 将原内容绘制到内存 DC
         BLENDFUNCTION blf{};
         blf.SourceConstantAlpha = 200;
         blf.BlendOp = AC_SRC_OVER;
-        AlphaBlend(memDC, 0, 0, dstWidth, dstHeight,
+        AlphaBlend(memDC, dstX, dstY, dstWidth, dstHeight,
             sdc, dstX, dstY, dstWidth, dstHeight, blf);
 
         // 将内存 DC 的内容复制到目标 DC
